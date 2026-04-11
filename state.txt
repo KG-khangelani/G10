@@ -1,0 +1,6 @@
+round=1
+player=G10
+health=100
+x=5
+y=3
+action=NONE
