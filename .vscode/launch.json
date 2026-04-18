@@ -1,0 +1,89 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Run Level 1",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}\\level1.exe",
+            "args": ["inputFiles\\level1input.txt"],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "miDebuggerPath": "C:\\mingw-w64-v11.0.0\\mingw64\\bin\\gdb.exe",
+            "preLaunchTask": "Build Level 1",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                }
+            ]
+        },
+        {
+            "name": "Run Level 2",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}\\level2.exe",
+            "args": ["inputFiles\\level2input.txt"],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "miDebuggerPath": "C:\\mingw-w64-v11.0.0\\mingw64\\bin\\gdb.exe",
+            "preLaunchTask": "Build Level 2",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                }
+            ]
+        },
+        {
+            "name": "Run Level 3",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}\\level3.exe",
+            "args": ["inputFiles\\level3input.txt"],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "miDebuggerPath": "C:\\mingw-w64-v11.0.0\\mingw64\\bin\\gdb.exe",
+            "preLaunchTask": "Build Level 3",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                }
+            ]
+        },
+        {
+            "name": "Run Level 4",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}\\level4.exe",
+            "args": ["inputFiles\\level4input.txt"],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "miDebuggerPath": "C:\\mingw-w64-v11.0.0\\mingw64\\bin\\gdb.exe",
+            "preLaunchTask": "Build Level 4",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                }
+            ]
+        }
+    ]
+}
