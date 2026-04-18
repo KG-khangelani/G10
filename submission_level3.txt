@@ -9549,7 +9549,7 @@
       "lap": 54,
       "pit": {
         "enter": true,
-        "fuel_refuel_amount_l": 137.67,
+        "fuel_refuel_amount_l": 115.93,
         "tyre_change_set_id": 4
       },
       "segments": [

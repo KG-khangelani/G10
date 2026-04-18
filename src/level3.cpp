@@ -181,6 +181,21 @@ static std::vector<double> optimize_targets(const RaceData &rd,
     return targets;
 }
 
+static double choose_refuel_amount(const RaceData &rd,
+                                   double fuel_remaining,
+                                   double next_fuel_est,
+                                   int laps_left)
+{
+    if (laps_left <= 0)
+        return 0.0;
+
+    double projected_need = next_fuel_est * laps_left * 1.05;
+    double target_fuel = std::min(rd.car.fuel_capacity, projected_need);
+    double amount = std::max(0.0, target_fuel - fuel_remaining);
+    amount = std::min(amount, rd.car.fuel_capacity - fuel_remaining);
+    return std::ceil(amount * 100.0) / 100.0;
+}
+
 static RaceEval simulate_race(const RaceData &rd, int initial_tyre_id, bool build_plan)
 {
     RaceEval eval;
@@ -287,9 +302,8 @@ static RaceEval simulate_race(const RaceData &rd, int initial_tyre_id, bool buil
             double refuel_amount = 0.0;
             if (need_refuel)
             {
-                refuel_amount = rd.car.fuel_capacity - fuel_remaining;
-                refuel_amount = std::max(0.0, refuel_amount);
-                refuel_amount = std::ceil(refuel_amount * 100.0) / 100.0;
+                int laps_left = rd.race.laps - lap - 1;
+                refuel_amount = choose_refuel_amount(rd, fuel_remaining, next_fuel_est, laps_left);
             }
 
             if (want_swap || refuel_amount > 0.0)

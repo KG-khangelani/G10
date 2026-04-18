@@ -153,10 +153,7 @@ int main(int argc, char *argv[])
     auto required_speed = resolve_corner_chains(
         rd.segments, best_tyre.friction, rd.car.crawl_speed, rd.car.max_speed);
 
-    double regular_entry_speed = rd.segments.empty() ? 0.0 :
-                                 (rd.segments.back().type == "corner"
-                                      ? required_speed.back()
-                                      : rd.car.crawl_speed);
+    double regular_entry_speed = rd.segments.empty() ? 0.0 : (rd.segments.back().type == "corner" ? required_speed.back() : rd.car.crawl_speed);
 
     auto first_lap_targets = optimize_targets(rd, required_speed, 0.0);
     auto regular_targets = optimize_targets(rd, required_speed, regular_entry_speed);
