@@ -635,9 +635,6 @@ static RaceEval simulate_race(const RaceData &rd, int initial_set_id, bool build
 
                 int laps_left = rd.race.laps - lap - 1;
                 double fuel_only_amount = choose_refuel_amount(rd, fuel_remaining, stay_next_lap.fuel, laps_left);
-                double fuel_swap_amount = swap_candidate_valid
-                                              ? choose_refuel_amount(rd, fuel_remaining, swap_next_lap.fuel, laps_left)
-                                              : 0.0;
 
                 PitChoice best_choice = evaluate_choice(0, 0.0);
                 if (fuel_only_amount > 0.0)
@@ -652,6 +649,7 @@ static RaceEval simulate_race(const RaceData &rd, int initial_set_id, bool build
                     if (swap_choice.valid && swap_choice.objective > best_choice.objective)
                         best_choice = swap_choice;
 
+                    double fuel_swap_amount = choose_refuel_amount(rd, fuel_remaining, swap_next_lap.fuel, laps_left);
                     if (fuel_swap_amount > 0.0)
                     {
                         PitChoice combo_choice = evaluate_choice(preferred_swap_id, fuel_swap_amount);

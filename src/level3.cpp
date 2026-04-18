@@ -14,6 +14,10 @@
 #include "physics.h"
 #include "output.h"
 
+#ifndef LEVEL3_LOOKAHEAD_HORIZON
+#define LEVEL3_LOOKAHEAD_HORIZON 2
+#endif
+
 struct LapEstimate
 {
     double time = 0.0;
@@ -31,6 +35,12 @@ struct RaceEval
     int initial_tyre_id = 0;
     std::string initial_compound;
     std::vector<LapPlan> lap_plans;
+};
+
+struct WindowEval
+{
+    bool valid = false;
+    double objective = -1e18;
 };
 
 static double time_until_weather_change(const std::vector<WeatherCondition> &conditions, double elapsed)
@@ -181,6 +191,28 @@ static std::vector<double> optimize_targets(const RaceData &rd,
     return targets;
 }
 
+static LapEstimate simulate_state_lap(const RaceData &rd,
+                                      double elapsed_time,
+                                      double entry_speed,
+                                      double fuel_available,
+                                      const std::string &compound)
+{
+    auto &wc = get_weather_at_time(rd.weather, elapsed_time);
+    double accel_eff = rd.car.accel * wc.accel_mult;
+    double brake_eff = rd.car.brake_decel * wc.decel_mult;
+
+    auto &tp = rd.tyre_props.at(compound);
+    double friction = tp.life_span * get_friction_multiplier(tp, wc.condition);
+    auto required_speed = resolve_corner_chains(rd.segments, friction,
+                                                rd.car.crawl_speed, rd.car.max_speed);
+    auto target_speeds = optimize_targets(rd, required_speed, entry_speed,
+                                          accel_eff, brake_eff);
+    auto straight_plans = compute_straight_plans(rd.segments, required_speed, target_speeds,
+                                                 rd.car.max_speed, brake_eff);
+    return simulate_lap(rd, required_speed, straight_plans,
+                        entry_speed, accel_eff, brake_eff);
+}
+
 static double choose_refuel_amount(const RaceData &rd,
                                    double fuel_remaining,
                                    double next_fuel_est,
@@ -194,6 +226,36 @@ static double choose_refuel_amount(const RaceData &rd,
     double amount = std::max(0.0, target_fuel - fuel_remaining);
     amount = std::min(amount, rd.car.fuel_capacity - fuel_remaining);
     return std::ceil(amount * 100.0) / 100.0;
+}
+
+static WindowEval evaluate_future_window(const RaceData &rd,
+                                         int current_lap,
+                                         int window_laps,
+                                         double elapsed_time,
+                                         double fuel_remaining,
+                                         double total_refueled,
+                                         double current_speed,
+                                         const std::string &current_compound)
+{
+    WindowEval eval;
+
+    for (int step = 0; step < window_laps; step++)
+    {
+        LapEstimate lap_est = simulate_state_lap(rd, elapsed_time, current_speed,
+                                                 fuel_remaining, current_compound);
+        elapsed_time += lap_est.time;
+        fuel_remaining -= lap_est.fuel;
+        current_speed = lap_est.exit_speed;
+
+        if (current_lap + step + 1 >= rd.race.laps - 1)
+            break;
+    }
+
+    double projected_fuel_used = rd.car.initial_fuel + total_refueled - fuel_remaining;
+    eval.objective = calc_base_score(rd.race.time_reference, elapsed_time) +
+                     calc_fuel_bonus(projected_fuel_used, rd.race.fuel_soft_cap);
+    eval.valid = true;
+    return eval;
 }
 
 static RaceEval simulate_race(const RaceData &rd, int initial_tyre_id, bool build_plan)
@@ -243,86 +305,124 @@ static RaceEval simulate_race(const RaceData &rd, int initial_tyre_id, bool buil
         if (lap < rd.race.laps - 1)
         {
             std::string next_weather = get_weather_string_at_time(rd.weather, elapsed_time);
-            auto &next_wc = get_weather_at_time(rd.weather, elapsed_time);
-            double next_accel = rd.car.accel * next_wc.accel_mult;
-            double next_brake = rd.car.brake_decel * next_wc.decel_mult;
             auto next_best = select_best_tyre(rd, next_weather);
 
-            bool want_swap = false;
+            auto &cur_tp = rd.tyre_props.at(current_compound);
+            double cur_fmult = get_friction_multiplier(cur_tp, next_weather);
+            double cur_friction = cur_tp.life_span * cur_fmult;
+
+            LapEstimate stay_next_lap = simulate_state_lap(rd, elapsed_time, current_speed,
+                                                           fuel_remaining, current_compound);
+            bool need_refuel = fuel_remaining < stay_next_lap.fuel * 1.05;
+
+            bool weather_opportunity = false;
             if (next_best.compound != current_compound)
             {
-                auto &cur_tp = rd.tyre_props.at(current_compound);
-                double cur_fmult = get_friction_multiplier(cur_tp, next_weather);
-                double cur_friction = cur_tp.life_span * cur_fmult;
                 double best_friction = next_best.friction;
-
-                if (best_friction > cur_friction * 1.10)
+                if (best_friction > cur_friction * 1.05)
                 {
                     double weather_remaining = time_until_weather_change(rd.weather, elapsed_time);
                     int race_laps_left = rd.race.laps - lap - 1;
                     double est_laps = std::min(weather_remaining / last_lap_time,
                                                static_cast<double>(race_laps_left));
-                    if (est_laps >= 5.0)
-                        want_swap = true;
+                    if (est_laps >= 4.0)
+                        weather_opportunity = true;
                 }
             }
 
-            auto &next_tp = rd.tyre_props.at(want_swap ? next_best.compound : current_compound);
-            double next_fmult = get_friction_multiplier(next_tp, next_weather);
-            double next_friction = next_tp.life_span * next_fmult;
-            auto next_req = resolve_corner_chains(rd.segments, next_friction,
-                                                  rd.car.crawl_speed, rd.car.max_speed);
-            double entry_sp = want_swap ? rd.race.pit_exit_speed : current_speed;
-            auto next_targets = optimize_targets(rd, next_req, entry_sp,
-                                                 next_accel, next_brake);
-            auto next_plans = compute_straight_plans(rd.segments, next_req, next_targets,
-                                                     rd.car.max_speed, next_brake);
-            double next_fuel_est = simulate_lap(rd, next_req, next_plans,
-                                                entry_sp, next_accel, next_brake)
-                                       .fuel;
-
-            bool need_refuel = fuel_remaining < next_fuel_est * 1.05;
-
-            if (!need_refuel && want_swap)
+            if (need_refuel || weather_opportunity)
             {
-                double laps_until_empty = fuel_remaining / next_fuel_est;
-                if (laps_until_empty <= 3.0)
-                    need_refuel = true;
-            }
-
-            if (need_refuel && !want_swap && next_best.compound != current_compound)
-            {
-                auto &cur_tp = rd.tyre_props.at(current_compound);
-                double cur_fmult = get_friction_multiplier(cur_tp, next_weather);
-                double cur_friction = cur_tp.life_span * cur_fmult;
-                if (next_best.friction > cur_friction * 1.05)
-                    want_swap = true;
-            }
-
-            double refuel_amount = 0.0;
-            if (need_refuel)
-            {
-                int laps_left = rd.race.laps - lap - 1;
-                refuel_amount = choose_refuel_amount(rd, fuel_remaining, next_fuel_est, laps_left);
-            }
-
-            if (want_swap || refuel_amount > 0.0)
-            {
-                double pit_time = pit_stop_time(refuel_amount, rd.race.pit_refuel_rate,
-                                                rd.race.pit_tyre_swap_time, rd.race.base_pit_time,
-                                                want_swap);
-                elapsed_time += pit_time;
-                fuel_remaining += refuel_amount;
-                total_refueled += refuel_amount;
-                current_speed = rd.race.pit_exit_speed;
-
-                int swap_id = want_swap ? next_best.id : 0;
-                lp.pit = {true, swap_id, refuel_amount};
-
-                if (want_swap)
+                struct PitChoice
                 {
-                    current_compound = next_best.compound;
-                    current_tyre_id = next_best.id;
+                    bool valid = false;
+                    double objective = -1e18;
+                    int swap_id = 0;
+                    std::string swap_compound;
+                    double refuel_amount = 0.0;
+                };
+
+                auto evaluate_choice = [&](bool want_swap, double refuel_amount)
+                {
+                    PitChoice choice;
+                    double candidate_elapsed = elapsed_time;
+                    double candidate_fuel = fuel_remaining;
+                    double candidate_refueled = total_refueled;
+                    double candidate_speed = current_speed;
+                    std::string candidate_compound = current_compound;
+
+                    if (want_swap || refuel_amount > 0.0)
+                    {
+                        double pit_time = pit_stop_time(refuel_amount, rd.race.pit_refuel_rate,
+                                                        rd.race.pit_tyre_swap_time, rd.race.base_pit_time,
+                                                        want_swap);
+                        candidate_elapsed += pit_time;
+                        candidate_fuel += refuel_amount;
+                        candidate_refueled += refuel_amount;
+                        candidate_speed = rd.race.pit_exit_speed;
+                        if (want_swap)
+                            candidate_compound = next_best.compound;
+                    }
+
+                    WindowEval window = evaluate_future_window(rd, lap,
+                                                               std::min(LEVEL3_LOOKAHEAD_HORIZON, rd.race.laps - lap - 1),
+                                                               candidate_elapsed, candidate_fuel,
+                                                               candidate_refueled, candidate_speed,
+                                                               candidate_compound);
+                    if (window.valid)
+                    {
+                        choice.valid = true;
+                        choice.objective = window.objective;
+                        choice.swap_id = want_swap ? next_best.id : 0;
+                        choice.swap_compound = want_swap ? next_best.compound : current_compound;
+                        choice.refuel_amount = refuel_amount;
+                    }
+                    return choice;
+                };
+
+                int laps_left = rd.race.laps - lap - 1;
+                LapEstimate swap_next_lap = simulate_state_lap(rd, elapsed_time + rd.race.base_pit_time,
+                                                               rd.race.pit_exit_speed, rd.car.fuel_capacity,
+                                                               next_best.compound);
+                double fuel_only_amount = choose_refuel_amount(rd, fuel_remaining, stay_next_lap.fuel, laps_left);
+                double fuel_swap_amount = choose_refuel_amount(rd, fuel_remaining, swap_next_lap.fuel, laps_left);
+
+                PitChoice best_choice = evaluate_choice(false, 0.0);
+                if (fuel_only_amount > 0.0)
+                {
+                    PitChoice fuel_choice = evaluate_choice(false, fuel_only_amount);
+                    if (fuel_choice.valid && fuel_choice.objective > best_choice.objective)
+                        best_choice = fuel_choice;
+                }
+                if (next_best.compound != current_compound)
+                {
+                    PitChoice swap_choice = evaluate_choice(true, 0.0);
+                    if (swap_choice.valid && swap_choice.objective > best_choice.objective)
+                        best_choice = swap_choice;
+
+                    if (fuel_swap_amount > 0.0)
+                    {
+                        PitChoice combo_choice = evaluate_choice(true, fuel_swap_amount);
+                        if (combo_choice.valid && combo_choice.objective > best_choice.objective)
+                            best_choice = combo_choice;
+                    }
+                }
+
+                if (best_choice.swap_id > 0 || best_choice.refuel_amount > 0.0)
+                {
+                    double pit_time = pit_stop_time(best_choice.refuel_amount, rd.race.pit_refuel_rate,
+                                                    rd.race.pit_tyre_swap_time, rd.race.base_pit_time,
+                                                    best_choice.swap_id > 0);
+                    elapsed_time += pit_time;
+                    fuel_remaining += best_choice.refuel_amount;
+                    total_refueled += best_choice.refuel_amount;
+                    current_speed = rd.race.pit_exit_speed;
+                    lp.pit = {true, best_choice.swap_id, best_choice.refuel_amount};
+
+                    if (best_choice.swap_id > 0)
+                    {
+                        current_compound = best_choice.swap_compound;
+                        current_tyre_id = best_choice.swap_id;
+                    }
                 }
             }
         }
