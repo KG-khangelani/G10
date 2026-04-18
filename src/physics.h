@@ -296,6 +296,30 @@ inline std::vector<StraightPlan> compute_straight_plans(
     return plans;
 }
 
+inline std::vector<StraightPlan> compute_straight_plans(
+    const std::vector<Segment> &segments,
+    const std::vector<double> &required_speed,
+    const std::vector<double> &target_speed_by_segment,
+    double max_speed, double brake_decel)
+{
+    int n = segments.size();
+    std::vector<StraightPlan> plans(n, {0, 0});
+    for (int i = 0; i < n; i++)
+    {
+        if (segments[i].type != "straight")
+            continue;
+
+        int next = (i + 1) % n;
+        double raw_target = i < static_cast<int>(target_speed_by_segment.size())
+                                ? target_speed_by_segment[i]
+                                : max_speed;
+        double target = std::clamp(raw_target, required_speed[next], max_speed);
+        double bd = braking_distance(target, required_speed[next], brake_decel);
+        plans[i] = {target, bd};
+    }
+    return plans;
+}
+
 // ══════════════════════════════════════════════
 //  Straight simulation (3-phase: accel → cruise → brake)
 // ══════════════════════════════════════════════
