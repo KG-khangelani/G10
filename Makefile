@@ -12,7 +12,7 @@ $(TARGET): $(SRCS)
 	$(CXX) $(CXXFLAGS) -o $@ $^
 
 run: $(TARGET)
-	./$(TARGET) state.txt
+	./$(TARGET) inputFiles/level1input.txt > submission_level1.txt
 
 clean:
 	$(RM) $(TARGET)

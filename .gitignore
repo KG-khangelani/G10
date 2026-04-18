@@ -40,3 +40,6 @@ bot
 
 # debug information files
 *.dwo
+
+# Third-party vendored headers
+src/json.hpp
