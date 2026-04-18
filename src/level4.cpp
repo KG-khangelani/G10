@@ -117,10 +117,10 @@ int find_any_set(const std::map<int, SetState> &all_sets,
 // Find best set considering weather preference order
 // Tries: 1) target compound, 2) 2nd-best for weather, 3) any compound
 int find_best_set_for_weather(const std::map<int, SetState> &all_sets,
-                               const RaceData &rd,
-                               const std::string &weather,
-                               int exclude_id,
-                               double min_remaining = 0.15)
+                              const RaceData &rd,
+                              const std::string &weather,
+                              int exclude_id,
+                              double min_remaining = 0.15)
 {
     // Build ranked list of compounds for this weather
     struct CompScore
@@ -393,7 +393,7 @@ int main(int argc, char *argv[])
                 // Use weather-ranked compound selection with minimum remaining life
                 double min_life = std::max(lap_degradation * 2.5, 0.15);
                 swap_id = find_best_set_for_weather(all_sets, rd, next_weather,
-                                                     current_set_id, min_life);
+                                                    current_set_id, min_life);
 
                 // Verify the selected set actually improves friction
                 // (avoid swapping to a more-degraded set of the same compound)
