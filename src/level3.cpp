@@ -1,5 +1,10 @@
-// Level 3: Weather adaptation + tyre swaps + fuel management
-// Weather cycles through conditions; need to swap tyres when weather changes
+// Level 3: Weather adaptation + tyre swaps + fuel management (OPTIMIZED)
+// Key optimizations:
+// 1. Only swap tyres when friction gain > 10% AND enough laps in new weather
+// 2. Combine refuel + swap into single pit stops
+// 3. Look-ahead to combine upcoming fuel stops with tyre swaps
+// 4. When pitting for fuel, add cheap swap if beneficial (+3s only)
+// 5. No empty pit stops
 // Scoring: base_score + fuel_bonus
 #include <iostream>
 #include <iomanip>
@@ -7,6 +12,59 @@
 #include "parser.h"
 #include "physics.h"
 #include "output.h"
+
+// Compute time remaining in current weather condition
+double time_until_weather_change(const std::vector<WeatherCondition> &conditions, double elapsed)
+{
+    if (conditions.empty())
+        return 1e18;
+    double total_cycle = 0;
+    for (auto &wc : conditions)
+        total_cycle += wc.duration;
+    double t = std::fmod(elapsed, total_cycle);
+    if (t < 0)
+        t += total_cycle;
+    double acc = 0;
+    for (auto &wc : conditions)
+    {
+        acc += wc.duration;
+        if (t < acc)
+            return acc - t;
+    }
+    return 0;
+}
+
+// Estimate fuel needed for one lap with given parameters
+double estimate_lap_fuel(const RaceData &rd, const std::vector<double> &req_speed,
+                         double target, double entry_speed,
+                         double accel_eff, double brake_eff)
+{
+    int n = rd.segments.size();
+    double fuel = 0;
+    double speed = entry_speed;
+    for (int i = 0; i < n; i++)
+    {
+        if (rd.segments[i].type == "straight")
+        {
+            int next = (i + 1) % n;
+            double bd = braking_distance(target, req_speed[next], brake_eff);
+            bd = std::ceil(bd * 100.0) / 100.0;
+            auto res = simulate_straight(speed, target, bd, rd.segments[i].length,
+                                         accel_eff, brake_eff,
+                                         rd.car.max_speed, rd.car.crawl_speed);
+            fuel += res.fuel;
+            speed = res.exit_speed;
+        }
+        else
+        {
+            double cs = std::min(speed, req_speed[i]);
+            cs = std::max(cs, rd.car.crawl_speed);
+            fuel += fuel_usage(cs, cs, rd.segments[i].length);
+            speed = cs;
+        }
+    }
+    return fuel;
+}
 
 int main(int argc, char *argv[])
 {
@@ -24,67 +82,36 @@ int main(int argc, char *argv[])
         std::cerr << w.condition << "(" << w.duration << "s) ";
     std::cerr << "\n";
 
-    // Forward simulate lap by lap, tracking time for weather
+    // Forward simulate lap by lap
     std::vector<LapPlan> lap_plans;
     double current_speed = 0.0;
     double fuel_remaining = rd.car.initial_fuel;
     double elapsed_time = 0.0;
-    std::string current_weather = rd.starting_weather;
-    int current_tyre_id = -1;
-    std::string current_compound;
-    double current_friction = 0;
-    bool first_tyre_selected = false;
 
-    // Track which tyre sets have been used (for L3 each set has 1 id, so no issue)
-    // We can reuse the same set if not blown
+    // Select initial tyre
+    auto initial = select_best_tyre(rd, rd.starting_weather);
+    int current_tyre_id = initial.id;
+    std::string current_compound = initial.compound;
+    double last_lap_time = 250.0; // initial estimate
+
+    std::cerr << "Initial tyre: " << current_compound << " (id=" << current_tyre_id << ")\n";
 
     for (int lap = 0; lap < rd.race.laps; lap++)
     {
-        // Determine weather at start of this lap
-        std::string weather_now = get_weather_string_at_time(rd.weather, elapsed_time);
+        // Get weather for this lap
         auto &wc = get_weather_at_time(rd.weather, elapsed_time);
+        std::string weather_now = wc.condition;
         double accel_eff = rd.car.accel * wc.accel_mult;
         double brake_eff = rd.car.brake_decel * wc.decel_mult;
 
-        // Select best tyre for current weather
-        auto best_tyre = select_best_tyre(rd, weather_now);
-
-        // Do we need a tyre swap?
-        bool need_tyre_swap = false;
-        if (!first_tyre_selected)
-        {
-            current_tyre_id = best_tyre.id;
-            current_compound = best_tyre.compound;
-            current_friction = best_tyre.friction;
-            first_tyre_selected = true;
-        }
-        else if (best_tyre.compound != current_compound)
-        {
-            // Weather changed, different tyre optimal — check if pit is worth it
-            // Cost: base_pit_time + tyre_swap_time = 23s; benefit: better friction → faster laps
-            // For simplicity, always swap when best compound changes
-            need_tyre_swap = true;
-        }
-
-        // If we swapped last lap, update tyre info
-        if (need_tyre_swap && lap > 0)
-        {
-            // We'll handle the pit at the END of prev lap; but we need to set tyre now
-            current_compound = best_tyre.compound;
-            current_friction = best_tyre.friction;
-            current_tyre_id = best_tyre.id;
-        }
-
-        // Recompute friction based on current tyre and weather
+        // Current tyre friction for this weather
         auto &tp = rd.tyre_props[current_compound];
         double friction_mult = get_friction_multiplier(tp, weather_now);
         double friction = tp.life_span * friction_mult;
 
-        // Resolve corner chains and straight plans for this lap
+        // Resolve corners and compute plans
         auto required_speed = resolve_corner_chains(
             rd.segments, friction, rd.car.crawl_speed, rd.car.max_speed);
-
-        // Use max speed as target
         double target = rd.car.max_speed;
         std::vector<StraightPlan> straight_plans(n, {0, 0});
         for (int i = 0; i < n; i++)
@@ -92,18 +119,15 @@ int main(int argc, char *argv[])
             if (rd.segments[i].type == "straight")
             {
                 int next = (i + 1) % n;
-                double exit_sp = required_speed[next];
-                double bd = braking_distance(target, exit_sp, brake_eff);
+                double bd = braking_distance(target, required_speed[next], brake_eff);
                 bd = std::ceil(bd * 100.0) / 100.0;
                 straight_plans[i] = {target, bd};
             }
         }
 
         // Simulate this lap
-        double lap_time = 0;
-        double lap_fuel = 0;
+        double lap_time = 0, lap_fuel = 0;
         double speed = current_speed;
-
         for (int i = 0; i < n; i++)
         {
             if (rd.segments[i].type == "straight")
@@ -129,87 +153,107 @@ int main(int argc, char *argv[])
         elapsed_time += lap_time;
         fuel_remaining -= lap_fuel;
         current_speed = speed;
+        last_lap_time = lap_time;
 
         // Build lap plan
         LapPlan lp;
         lp.straight_plans = straight_plans;
         lp.pit = {false, 0, 0};
 
-        // Check if we need to pit: tyre swap or refuel
+        // ── Pit decisions (end of lap) ──
         if (lap < rd.race.laps - 1)
         {
-            // Check weather for next lap
             std::string next_weather = get_weather_string_at_time(rd.weather, elapsed_time);
-            auto next_best = select_best_tyre(rd, next_weather);
-            bool swap_next = (next_best.compound != current_compound);
-
-            // Estimate fuel for next lap
             auto &next_wc = get_weather_at_time(rd.weather, elapsed_time);
             double next_accel = rd.car.accel * next_wc.accel_mult;
             double next_brake = rd.car.brake_decel * next_wc.decel_mult;
-            auto &next_tp = rd.tyre_props[swap_next ? next_best.compound : current_compound];
-            double next_fmult = get_friction_multiplier(next_tp, next_weather);
-            double next_friction = next_tp.life_span * next_fmult;
-            auto next_req = resolve_corner_chains(rd.segments, next_friction, rd.car.crawl_speed, rd.car.max_speed);
+            auto next_best = select_best_tyre(rd, next_weather);
 
-            // Estimate next lap fuel at max speed
-            double next_fuel_estimate = 0;
-            double sp = swap_next ? rd.race.pit_exit_speed : speed;
-            for (int i = 0; i < n; i++)
+            // Evaluate tyre swap: friction gain must be > 10%
+            bool want_swap = false;
+            if (next_best.compound != current_compound)
             {
-                if (rd.segments[i].type == "straight")
+                auto &cur_tp = rd.tyre_props[current_compound];
+                double cur_fmult = get_friction_multiplier(cur_tp, next_weather);
+                double cur_friction = cur_tp.life_span * cur_fmult;
+                double best_friction = next_best.friction;
+
+                if (best_friction > cur_friction * 1.10)
                 {
-                    int nx = (i + 1) % n;
-                    double exit_sp = next_req[nx];
-                    double bd = braking_distance(target, exit_sp, next_brake);
-                    bd = std::ceil(bd * 100.0) / 100.0;
-                    auto res = simulate_straight(sp, target, bd, rd.segments[i].length,
-                                                 next_accel, next_brake,
-                                                 rd.car.max_speed, rd.car.crawl_speed);
-                    next_fuel_estimate += res.fuel;
-                    sp = res.exit_speed;
-                }
-                else
-                {
-                    double cs = std::min(sp, next_req[i]);
-                    cs = std::max(cs, rd.car.crawl_speed);
-                    next_fuel_estimate += fuel_usage(cs, cs, rd.segments[i].length);
-                    sp = cs;
+                    // Check if enough laps remain (min of weather duration and race end)
+                    double weather_remaining = time_until_weather_change(rd.weather, elapsed_time);
+                    int race_laps_left = rd.race.laps - lap - 1;
+                    double est_laps = std::min(weather_remaining / last_lap_time,
+                                               (double)race_laps_left);
+                    if (est_laps >= 5.0)
+                    {
+                        want_swap = true;
+                    }
                 }
             }
 
-            bool need_refuel = fuel_remaining < next_fuel_estimate * 1.05;
+            // Estimate fuel for next lap (using whichever tyre we'll have)
+            auto &next_tp = rd.tyre_props[want_swap ? next_best.compound : current_compound];
+            double next_fmult = get_friction_multiplier(next_tp, next_weather);
+            double next_friction = next_tp.life_span * next_fmult;
+            auto next_req = resolve_corner_chains(rd.segments, next_friction,
+                                                  rd.car.crawl_speed, rd.car.max_speed);
+            double entry_sp = want_swap ? rd.race.pit_exit_speed : speed;
+            double next_fuel_est = estimate_lap_fuel(rd, next_req, target, entry_sp,
+                                                     next_accel, next_brake);
 
-            if (swap_next || need_refuel)
+            bool need_refuel = fuel_remaining < next_fuel_est * 1.05;
+
+            // Look ahead: if fuel needed within 3 laps AND swap is wanted, combine now
+            if (!need_refuel && want_swap)
             {
-                double refuel_amount = 0;
-                if (need_refuel)
-                {
-                    int laps_left = rd.race.laps - lap - 1;
-                    double fuel_needed = next_fuel_estimate * laps_left;
-                    refuel_amount = std::min(fuel_needed - fuel_remaining, rd.car.fuel_capacity - fuel_remaining);
-                    refuel_amount = std::max(0.0, refuel_amount);
-                    refuel_amount = std::min(refuel_amount, rd.car.fuel_capacity - fuel_remaining);
-                    refuel_amount = std::ceil(refuel_amount * 100.0) / 100.0;
-                }
+                double laps_until_empty = fuel_remaining / next_fuel_est;
+                if (laps_until_empty <= 3.0)
+                    need_refuel = true;
+            }
 
+            // If pitting for fuel anyway, check if adding a cheap swap (+3s) is beneficial
+            if (need_refuel && !want_swap && next_best.compound != current_compound)
+            {
+                auto &cur_tp = rd.tyre_props[current_compound];
+                double cur_fmult = get_friction_multiplier(cur_tp, next_weather);
+                double cur_friction = cur_tp.life_span * cur_fmult;
+                // Lower threshold since swap only costs +3s when already pitting
+                if (next_best.friction > cur_friction * 1.05)
+                    want_swap = true;
+            }
+
+            // Compute refuel amount
+            double refuel_amount = 0;
+            if (need_refuel)
+            {
+                // Refuel to capacity (minimize future pit stops)
+                refuel_amount = rd.car.fuel_capacity - fuel_remaining;
+                refuel_amount = std::max(0.0, refuel_amount);
+                refuel_amount = std::ceil(refuel_amount * 100.0) / 100.0;
+            }
+
+            // Only pit if there's actual work to do
+            if (want_swap || refuel_amount > 0)
+            {
                 double pt = pit_stop_time(refuel_amount, rd.race.pit_refuel_rate,
-                                          rd.race.pit_tyre_swap_time, rd.race.base_pit_time, swap_next);
+                                          rd.race.pit_tyre_swap_time, rd.race.base_pit_time,
+                                          want_swap);
                 elapsed_time += pt;
                 fuel_remaining += refuel_amount;
                 current_speed = rd.race.pit_exit_speed;
 
-                int swap_id = swap_next ? next_best.id : 0;
+                int swap_id = want_swap ? next_best.id : 0;
                 lp.pit = {true, swap_id, refuel_amount};
 
-                if (swap_next)
+                if (want_swap)
                 {
                     current_compound = next_best.compound;
                     current_tyre_id = next_best.id;
-                    current_friction = next_best.friction;
                 }
 
-                std::cerr << "Pit after lap " << lap + 1 << ": swap=" << (swap_next ? next_best.compound : "no")
+                std::cerr << "Pit after lap " << lap + 1
+                          << ": swap=" << (want_swap ? next_best.compound : "no")
                           << " refuel=" << refuel_amount << "L time=" << pt << "s\n";
             }
         }
@@ -217,7 +261,7 @@ int main(int argc, char *argv[])
         lap_plans.push_back(lp);
     }
 
-    // Compute fuel burned
+    // Compute scoring
     double total_refueled = 0;
     for (auto &lp : lap_plans)
         if (lp.pit.enter)
@@ -235,8 +279,6 @@ int main(int argc, char *argv[])
     std::cerr << "Fuel bonus: " << fuel_bonus << "\n";
     std::cerr << "Final score: " << final_score << "\n";
 
-    // Initial tyre = first tyre selected
-    int init_tyre = lap_plans.empty() ? 1 : select_best_tyre(rd, rd.starting_weather).id;
-    std::cout << generate_output(init_tyre, rd.segments, lap_plans, rd.race.laps).dump(2) << std::endl;
+    std::cout << generate_output(initial.id, rd.segments, lap_plans, rd.race.laps).dump(2) << std::endl;
     return 0;
 }
