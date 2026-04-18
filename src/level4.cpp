@@ -27,6 +27,16 @@ struct SetState
     bool blown;
 };
 
+struct LapEstimate
+{
+    double time = 0.0;
+    double fuel = 0.0;
+    double exit_speed = 0.0;
+    double degradation = 0.0;
+    bool limp_mode = false;
+    bool blown = false;
+};
+
 // Compute time remaining in current weather condition
 double time_until_weather_change(const std::vector<WeatherCondition> &conditions, double elapsed)
 {
@@ -153,6 +163,156 @@ int find_best_set_for_weather(const std::map<int, SetState> &all_sets,
     return find_any_set(all_sets, rd.tyre_sets, exclude_id, 0.01);
 }
 
+static std::vector<int> get_straight_indices(const RaceData &rd)
+{
+    std::vector<int> indices;
+    for (int i = 0; i < static_cast<int>(rd.segments.size()); i++)
+    {
+        if (rd.segments[i].type == "straight")
+            indices.push_back(i);
+    }
+    return indices;
+}
+
+static LapEstimate simulate_lap(const RaceData &rd,
+                                const std::vector<double> &required_speed,
+                                const std::vector<StraightPlan> &straight_plans,
+                                double entry_speed,
+                                double accel_eff,
+                                double brake_eff,
+                                double deg_rate,
+                                double fuel_available,
+                                double current_degradation,
+                                double tyre_life_span)
+{
+    LapEstimate estimate;
+    int n = static_cast<int>(rd.segments.size());
+    double speed = entry_speed;
+
+    for (int i = 0; i < n; i++)
+    {
+        if (estimate.limp_mode)
+        {
+            double t = rd.segments[i].length / rd.car.limp_speed;
+            estimate.time += t;
+            estimate.fuel += fuel_usage(rd.car.limp_speed, rd.car.limp_speed, rd.segments[i].length);
+            speed = rd.car.limp_speed;
+            continue;
+        }
+
+        if (rd.segments[i].type == "straight")
+        {
+            auto res = simulate_straight(speed, straight_plans[i].target_speed,
+                                         straight_plans[i].brake_start, rd.segments[i].length,
+                                         accel_eff, brake_eff,
+                                         rd.car.max_speed, rd.car.crawl_speed);
+            estimate.time += res.time;
+            estimate.fuel += res.fuel;
+            estimate.degradation += tyre_deg_straight(deg_rate, rd.segments[i].length);
+            if (res.distance_brake > 0 && res.speed_at_brake > res.exit_speed)
+                estimate.degradation += tyre_deg_braking(deg_rate, res.speed_at_brake, res.exit_speed);
+            speed = res.exit_speed;
+        }
+        else
+        {
+            double cs = std::min(speed, required_speed[i]);
+            cs = std::max(cs, rd.car.crawl_speed);
+            estimate.time += rd.segments[i].length / cs;
+            estimate.fuel += fuel_usage(cs, cs, rd.segments[i].length);
+            estimate.degradation += tyre_deg_corner(deg_rate, cs, rd.segments[i].radius);
+            speed = cs;
+        }
+
+        if (fuel_available - estimate.fuel <= 0)
+        {
+            estimate.limp_mode = true;
+            speed = rd.car.limp_speed;
+        }
+        if (current_degradation + estimate.degradation >= tyre_life_span)
+        {
+            estimate.limp_mode = true;
+            estimate.blown = true;
+            speed = rd.car.limp_speed;
+        }
+    }
+
+    estimate.exit_speed = speed;
+    return estimate;
+}
+
+static std::vector<double> optimize_targets(const RaceData &rd,
+                                            const std::vector<double> &required_speed,
+                                            double entry_speed,
+                                            double accel_eff,
+                                            double brake_eff,
+                                            double deg_rate,
+                                            double fuel_available,
+                                            double current_degradation,
+                                            double tyre_life_span)
+{
+    int n = static_cast<int>(rd.segments.size());
+    std::vector<double> targets(n, 0.0);
+    for (int i = 0; i < n; i++)
+    {
+        if (rd.segments[i].type == "straight")
+            targets[i] = rd.car.max_speed;
+    }
+
+    auto straight_indices = get_straight_indices(rd);
+    auto eval_time = [&](const std::vector<double> &candidate)
+    {
+        auto plans = compute_straight_plans(rd.segments, required_speed, candidate,
+                                            rd.car.max_speed, brake_eff);
+        return simulate_lap(rd, required_speed, plans, entry_speed, accel_eff, brake_eff,
+                            deg_rate, fuel_available, current_degradation, tyre_life_span)
+            .time;
+    };
+
+    double best_time = eval_time(targets);
+    const std::vector<double> steps = {8.0, 2.0, 0.5, 0.1};
+
+    for (double step : steps)
+    {
+        bool improved = true;
+        while (improved)
+        {
+            improved = false;
+            for (int idx : straight_indices)
+            {
+                double current = targets[idx];
+                int next = (idx + 1) % n;
+                double floor_target = std::max(required_speed[next], rd.car.crawl_speed);
+                double local_best_target = current;
+                double local_best_time = best_time;
+
+                double local_lo = std::max(floor_target, current - step * 4.0);
+                double local_hi = std::min(rd.car.max_speed, current + step * 2.0);
+
+                for (double ts = local_lo; ts <= local_hi + 1e-9; ts += step)
+                {
+                    std::vector<double> candidate = targets;
+                    candidate[idx] = ts;
+                    double candidate_time = eval_time(candidate);
+                    if (candidate_time + 1e-9 < local_best_time)
+                    {
+                        local_best_time = candidate_time;
+                        local_best_target = ts;
+                    }
+                }
+
+                if (std::abs(local_best_target - current) > 1e-9)
+                {
+                    targets[idx] = local_best_target;
+                    best_time = local_best_time;
+                    improved = true;
+                }
+            }
+        }
+    }
+
+    return targets;
+}
+
 int main(int argc, char *argv[])
 {
     std::string inputPath = "inputFiles/level4input.txt";
@@ -216,73 +376,22 @@ int main(int argc, char *argv[])
         auto required_speed = resolve_corner_chains(
             rd.segments, tyre_friction, rd.car.crawl_speed, rd.car.max_speed);
 
-        double target = rd.car.max_speed;
-        std::vector<StraightPlan> straight_plans(n, {0, 0});
-        for (int i = 0; i < n; i++)
-        {
-            if (rd.segments[i].type == "straight")
-            {
-                int next = (i + 1) % n;
-                double exit_sp = required_speed[next];
-                double bd = braking_distance(target, exit_sp, brake_eff);
-                bd = std::ceil(bd * 100.0) / 100.0;
-                straight_plans[i] = {target, bd};
-            }
-        }
+        auto target_speeds = optimize_targets(rd, required_speed, current_speed,
+                                              accel_eff, brake_eff, deg_rate,
+                                              fuel_remaining, current_degradation, tp.life_span);
+        auto straight_plans = compute_straight_plans(rd.segments, required_speed, target_speeds,
+                                                     rd.car.max_speed, brake_eff);
+        LapEstimate lap_est = simulate_lap(rd, required_speed, straight_plans,
+                                           current_speed, accel_eff, brake_eff, deg_rate,
+                                           fuel_remaining, current_degradation, tp.life_span);
 
-        // Simulate this lap segment by segment
-        double lap_time = 0;
-        double lap_fuel = 0;
-        double speed = current_speed;
-        double lap_degradation = 0;
-        bool limp_mode = false;
-
-        for (int i = 0; i < n; i++)
-        {
-            if (limp_mode)
-            {
-                double t = rd.segments[i].length / rd.car.limp_speed;
-                lap_time += t;
-                lap_fuel += fuel_usage(rd.car.limp_speed, rd.car.limp_speed, rd.segments[i].length);
-                speed = rd.car.limp_speed;
-                continue;
-            }
-
-            if (rd.segments[i].type == "straight")
-            {
-                auto res = simulate_straight(speed, straight_plans[i].target_speed,
-                                             straight_plans[i].brake_start, rd.segments[i].length,
-                                             accel_eff, brake_eff,
-                                             rd.car.max_speed, rd.car.crawl_speed);
-                lap_time += res.time;
-                lap_fuel += res.fuel;
-                lap_degradation += tyre_deg_straight(deg_rate, rd.segments[i].length);
-                if (res.distance_brake > 0 && res.speed_at_brake > res.exit_speed)
-                    lap_degradation += tyre_deg_braking(deg_rate, res.speed_at_brake, res.exit_speed);
-                speed = res.exit_speed;
-            }
-            else
-            {
-                double cs = std::min(speed, required_speed[i]);
-                cs = std::max(cs, rd.car.crawl_speed);
-                lap_time += rd.segments[i].length / cs;
-                lap_fuel += fuel_usage(cs, cs, rd.segments[i].length);
-                lap_degradation += tyre_deg_corner(deg_rate, cs, rd.segments[i].radius);
-                speed = cs;
-            }
-
-            if (fuel_remaining - lap_fuel <= 0)
-            {
-                limp_mode = true;
-                speed = rd.car.limp_speed;
-            }
-            if (current_degradation + lap_degradation >= tp.life_span)
-            {
-                limp_mode = true;
-                speed = rd.car.limp_speed;
-                all_sets[current_set_id].blown = true;
-            }
-        }
+        double lap_time = lap_est.time;
+        double lap_fuel = lap_est.fuel;
+        double speed = lap_est.exit_speed;
+        double lap_degradation = lap_est.degradation;
+        bool limp_mode = lap_est.limp_mode;
+        if (lap_est.blown)
+            all_sets[current_set_id].blown = true;
 
         elapsed_time += lap_time;
         fuel_remaining -= lap_fuel;
@@ -343,29 +452,21 @@ int main(int argc, char *argv[])
             double est_friction = want_swap ? next_best.friction : std::max(next_friction, 0.1);
             auto next_req = resolve_corner_chains(rd.segments, est_friction,
                                                   rd.car.crawl_speed, rd.car.max_speed);
-            double next_fuel_est = 0;
-            double sp = want_swap ? rd.race.pit_exit_speed : current_speed;
-            for (int i = 0; i < n; i++)
-            {
-                if (rd.segments[i].type == "straight")
-                {
-                    int nx = (i + 1) % n;
-                    double bd = braking_distance(target, next_req[nx], next_brake);
-                    bd = std::ceil(bd * 100.0) / 100.0;
-                    auto res = simulate_straight(sp, target, bd, rd.segments[i].length,
-                                                 next_accel, next_brake,
-                                                 rd.car.max_speed, rd.car.crawl_speed);
-                    next_fuel_est += res.fuel;
-                    sp = res.exit_speed;
-                }
-                else
-                {
-                    double cs = std::min(sp, next_req[i]);
-                    cs = std::max(cs, rd.car.crawl_speed);
-                    next_fuel_est += fuel_usage(cs, cs, rd.segments[i].length);
-                    sp = cs;
-                }
-            }
+            double next_entry_speed = want_swap ? rd.race.pit_exit_speed : current_speed;
+            double next_deg_rate = get_degradation_rate(want_swap ? rd.tyre_props[next_best.compound] : cur_tp,
+                                                        next_weather);
+            double next_current_deg = want_swap ? 0.0 : current_degradation;
+            double next_life_span = want_swap ? rd.tyre_props[next_best.compound].life_span : cur_tp.life_span;
+            auto next_targets = optimize_targets(rd, next_req, next_entry_speed,
+                                                 next_accel, next_brake, next_deg_rate,
+                                                 rd.car.fuel_capacity, next_current_deg, next_life_span);
+            auto next_plans = compute_straight_plans(rd.segments, next_req, next_targets,
+                                                     rd.car.max_speed, next_brake);
+            double next_fuel_est = simulate_lap(rd, next_req, next_plans,
+                                                next_entry_speed, next_accel, next_brake,
+                                                next_deg_rate, rd.car.fuel_capacity,
+                                                next_current_deg, next_life_span)
+                                       .fuel;
 
             bool need_refuel = fuel_remaining < next_fuel_est * 1.05;
 
