@@ -553,8 +553,8 @@ static RaceEval simulate_race(const RaceData &rd, int initial_set_id, bool build
                 {
                     std::string swap_compound = all_sets.at(preferred_swap_id).compound;
                     swap_next_lap = simulate_state_lap(rd, elapsed_time + rd.race.base_pit_time,
-                                                      rd.race.pit_exit_speed, rd.car.fuel_capacity,
-                                                      swap_compound, all_sets.at(preferred_swap_id).degradation);
+                                                       rd.race.pit_exit_speed, rd.car.fuel_capacity,
+                                                       swap_compound, all_sets.at(preferred_swap_id).degradation);
                     swap_candidate_valid = true;
                 }
             }
